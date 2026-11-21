@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+# raw CelesTrak downloads (data/sats.json is the committed snapshot)
+data/raw/
+data/fetch.log
+*.tmp

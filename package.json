@@ -1,0 +1,14 @@
+{
+  "name": "orbit-lines",
+  "version": "0.1.0",
+  "description": "Draw one line on the Earth and see which satellites' orbits follow it.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "npx --yes serve . -l 8010",
+    "fetch-data": "node tools/fetch_sats.js",
+    "rebuild-data": "node tools/fetch_sats.js --rebuild"
+  },
+  "engines": { "node": ">=18" },
+  "keywords": ["satellites", "orbits", "creative-coding", "canvas", "sgp4"]
+}
