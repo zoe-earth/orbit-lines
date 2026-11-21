@@ -28,6 +28,7 @@ let sats = [];                       // { name, alt, inc, track }  track = flat 
 let drawing = false, sketch = [];    // your stroke so far, in screen pixels
 let line = null;                     // the recognized line: { keys, points, tol }
 let results = [], selected = 0;      // matching satellites, and which one is highlighted
+let showStarlink = true;             // the Starlink toggle: off hides them everywhere (dots, matching, list)
 let revealedAt = 0;                  // when the first line was finished (satellites fade in from here)
 
 // ---------- vector helpers --------------------------------------------------
@@ -60,7 +61,8 @@ async function loadSatellites() {
   const start = Date.now();
   const spin = [...Array(MINUTES)].map((_, m) => satellite.gstime(new Date(start + m * 60000)));   // Earth's rotation each minute
 
-  for (const o of catalog) {
+  for (const [n, o] of catalog.entries()) {
+    if (n % 400 === 0) { head.textContent = `loading satellites… ${n} / ${catalog.length}`; await new Promise(r => setTimeout(r)); }   // let the page breathe
     const rec = satellite.json2satrec(o), epoch = Date.parse(o.EPOCH + 'Z'), track = [];
     for (let m = 0; m < MINUTES; m++) {
       const p = satellite.sgp4(rec, (start + m * 60000 - epoch) / 60000)?.position;   // position in space (km)
@@ -70,7 +72,7 @@ async function loadSatellites() {
       track.push((p.x * c + p.y * s) / r, (-p.x * s + p.y * c) / r, p.z / r);          // turn with the Earth, keep direction only
     }
     if (track.length === MINUTES * 3) sats.push({
-      name: o.OBJECT_NAME, inc: +o.INCLINATION, track,
+      name: o.OBJECT_NAME, inc: +o.INCLINATION, track, starlink: o.OBJECT_NAME.startsWith('STARLINK'),
       alt: Math.round(Math.cbrt(398600.4418 / (o.MEAN_MOTION * 2 * Math.PI / 86400) ** 2) - EARTH_KM),   // Kepler's 3rd law
     });
   }
@@ -81,6 +83,14 @@ async function loadSatellites() {
 function trackPoint(track, minute) {
   const m = clamp(Math.floor(minute), 0, MINUTES - 2), t = clamp(minute - m, 0, 1), i = m * 3;
   return unit([0, 1, 2].map(k => track[i + k] * (1 - t) + track[i + 3 + k] * t));
+}
+
+// same idea, but straight to pixels with no allocations (called ~25,000 times per frame)
+function trackScreen(track, minute) {
+  const m = clamp(Math.floor(minute), 0, MINUTES - 2), t = clamp(minute - m, 0, 1), i = m * 3;
+  const x = track[i] * (1 - t) + track[i + 3] * t, y = track[i + 1] * (1 - t) + track[i + 4] * t, z = track[i + 2] * (1 - t) + track[i + 5] * t;
+  const a = x * cosLon + y * sinLon, b = -x * sinLon + y * cosLon;
+  return { x: cx + radius * b, y: cy - radius * (z * cosLat - a * sinLat), front: a * cosLat + z * sinLat > 0 };
 }
 
 // ---------- 1. DRAW: snap the stroke to a straight line or one bend ---------
@@ -145,6 +155,7 @@ function closestOnTrack(track, p) {                  // -> [distance, minute] of
 function match(line) {
   const found = [];
   for (const sat of sats) {
+    if (sat.starlink && !showStarlink) continue;
     const nearest = line.points.map(p => closestOnTrack(sat.track, p));           // [distance, minute] for every point
     const closest = nearest.reduce((a, b) => (b[0] < a[0] ? b : a));
     if (closest[0] > line.tol) continue;                                           // never comes near the line
@@ -177,6 +188,13 @@ canvas.onpointerup = () => {
   if (!revealedAt) revealedAt = performance.now();           // first line: bring the satellites in
   document.body.classList.add('started');
 };
+function toggleStarlink() {
+  showStarlink = !showStarlink;
+  const button = document.getElementById('starlink');
+  button.textContent = 'Starlink: ' + (showStarlink ? 'on' : 'off'); button.classList.toggle('off', !showStarlink);
+  if (line) { results = match(line); selected = 0; showResults(); }   // find the matches again without/with Starlink
+}
+document.getElementById('starlink').onclick = toggleStarlink;
 function restart() {
   line = null; sketch = []; results = []; drawing = false; revealedAt = 0;
   document.body.classList.remove('started'); showPrompt();
@@ -184,6 +202,7 @@ function restart() {
 document.getElementById('restart').onclick = restart;
 addEventListener('keydown', e => {
   if (e.key === 'Escape') restart();
+  if (e.key === 's' || e.key === 'S') toggleStarlink();
   if (!results.length) return;
   if (e.key === 'ArrowRight') { selected = (selected + 1) % results.length; showResults(); }
   if (e.key === 'ArrowLeft') { selected = (selected + results.length - 1) % results.length; showResults(); }
@@ -194,13 +213,16 @@ function showPrompt(message = '') {
   head.textContent = `draw one line in the circle:\nstraight, or with one bend\n${message}`; list.textContent = '';
 }
 function showResults() {
+  const starlinks = results.filter(r => r.sat.starlink).length;
   head.textContent = `${line.keys.length === 3 ? 'one bend' : 'straight line'} · ${results.length} satellites on your line ` +
-    `(±${Math.round(line.tol * EARTH_KM)} km)\n${results.length ? '' : 'none — try another line\n'}click a name, or ← → · esc to clear`;
+    `(±${Math.round(line.tol * EARTH_KM)} km)\n${showStarlink ? `${starlinks} Starlink · ${results.length - starlinks} other` : 'Starlink hidden'}\n` +
+    `${results.length ? '' : 'none — try another line\n'}click a name, or ← → · esc to clear`;
   list.textContent = '';
   results.forEach((r, i) => {
     const row = document.createElement('div'), name = document.createElement('span'), info = document.createElement('span');
     row.className = 'row' + (i === selected ? ' sel' : '');
     name.textContent = r.sat.name; info.textContent = `${r.sat.alt} km · ${Math.round(r.sat.inc)}°`;
+    if (r.sat.starlink) { const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = 'STARLINK  '; info.prepend(tag); }
     row.append(name, info);
     row.onclick = () => { selected = i; showResults(); };
     list.appendChild(row);
@@ -211,6 +233,7 @@ function showResults() {
 // ---------- drawing helpers -------------------------------------------------
 function strokePath(color, width) { ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke(); }
 function dot2d(p, r, color) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill(); }
+function ring2d(p, r, color) { ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.stroke(); }
 
 function polyline(vectors) {                         // trace globe points as a path, breaking at the horizon
   ctx.beginPath(); let down = false;
@@ -220,7 +243,7 @@ function polyline(vectors) {                         // trace globe points as a 
   }
 }
 function trail(track, minute, length) {              // adds a short comet trail to the current path; returns the head position
-  const head = toScreen(trackPoint(track, minute)), tail = toScreen(trackPoint(track, minute - length));
+  const head = trackScreen(track, minute), tail = trackScreen(track, minute - length);
   if (!head.front) return null;
   if (tail.front) { ctx.moveTo(tail.x, tail.y); ctx.lineTo(head.x, head.y); }
   return head;
@@ -230,7 +253,7 @@ function trail(track, minute, length) {              // adds a short comet trail
 function drawCatalog(seconds, fadeIn) {              // every satellite, orbiting (real motion, 2 min per second)
   const minute = (seconds * 2) % 120, fade = fadeIn * Math.min(1, minute / 4, (120 - minute) / 4);   // fade at the loop point
   const heads = []; ctx.beginPath();
-  for (const s of sats) { const h = trail(s.track, minute, 1); if (h) heads.push(h); }
+  for (const s of sats) { if (s.starlink && !showStarlink) continue; const h = trail(s.track, minute, 1); if (h) heads.push(h); }
   strokePath(`rgba(255,255,255,${0.2 * fade})`, 1);
   ctx.fillStyle = `rgba(255,255,255,${0.45 * fade})`;
   for (const h of heads) ctx.fillRect(h.x - 0.9, h.y - 0.9, 1.8, 1.8);
@@ -259,7 +282,7 @@ function drawMatches(seconds, top) {                 // each match floats along 
   strokePath('rgba(255,255,255,.4)', 1);
   ctx.font = '12px Helvetica, Arial, sans-serif';
   for (const [h, r] of heads) {
-    dot2d(h, r === top ? 5 : 2.6, r === top ? LIME : WHITE);
+    if (r === top) dot2d(h, 5, LIME); else if (r.sat.starlink) ring2d(h, 3, WHITE); else dot2d(h, 2.6, WHITE);   // ring = Starlink
     if (r === top) { ctx.fillStyle = WHITE; ctx.fillText(r.sat.name, h.x + 10, h.y - 8); }
   }
 }

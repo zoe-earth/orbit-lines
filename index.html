@@ -16,18 +16,24 @@
   .row:hover { background: #161616; }
   .row.sel { background: #c8ff00; color: #000; }
   #restart { position: fixed; left: 20px; bottom: 20px; font: 13px Helvetica, Arial, sans-serif; color: #eee; background: #000; border: 1px solid #eee; padding: 6px 14px; cursor: pointer; }
+  #starlink { position: fixed; left: 110px; bottom: 20px; font: 13px Helvetica, Arial, sans-serif; color: #eee; background: #000; border: 1px solid #eee; padding: 6px 14px; cursor: pointer; }
+  #starlink.off { color: #777; border-color: #555; }
+  #starlink:hover { background: #c8ff00; color: #000; border-color: #c8ff00; }
   #restart:hover { background: #c8ff00; color: #000; border-color: #c8ff00; }
-  #info, #restart { opacity: 0; pointer-events: none !important; transition: opacity 1.2s; }
-  body.started #info, body.started #restart { opacity: 1; }
-  body.started #restart { pointer-events: auto !important; }
+  #info, #restart, #starlink { opacity: 0; pointer-events: none !important; transition: opacity 1.2s; }
+  body.started #info, body.started #restart, body.started #starlink { opacity: 1; }
+  body.started #restart, body.started #starlink { pointer-events: auto !important; }
   body.started #list { pointer-events: auto; }
   .row.sel span:last-child { color: #333; }
+  .row span.tag { color: #c8ff00; letter-spacing: .04em; }
+  .row.sel span.tag { color: #000; font-weight: bold; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="info"><h1>Orbit Lines</h1><div id="head">loading…</div><div id="list"></div></div>
 <button id="restart">Restart</button>
+<button id="starlink">Starlink: on</button>
 <script src="vendor/satellite.min.js"></script>
 <script src="app.js"></script>
 </body>
