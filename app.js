@@ -1,218 +1,291 @@
-// ORBIT LINES — draw a line (straight, or with ONE bend) inside the circle;
-// see which satellites' ground tracks follow it.
+// ORBIT LINES
+// Draw a line (straight, or with one bend) on a circle that stands for the Earth.
+// Satellites whose ground tracks run along your line get picked out.
 //
-//   1. your stroke is snapped to a straight line or a single-bend polyline
-//   2. that shape is resampled to NS evenly spaced points (the "recognized" line)
-//   3. every satellite's ground track (next 2 h, 1-min steps) is compared to those points
-//   4. a point is "hit" if the track passes within a tolerance of it (one pass only)
-//   5. satellites are ranked by how many points they hit
+// The whole idea, in four steps:
+//   1. DRAW    snap your stroke to a straight line or one bend           fitShape()
+//   2. SAMPLE  turn that shape into 48 evenly spaced points on the globe  resample()
+//   3. TRACKS  run every satellite's orbit forward 2 hours -> ground track  loadSatellites()
+//   4. MATCH   a point is "hit" if a track passes near it; rank by hits     match()
 //
-// Controls: drag = draw · ←/→ = pick a match · esc = clear
+// Points on the globe are unit vectors [x, y, z]: z points at the north pole,
+// x points at longitude 0 on the equator. Everything else is just drawing.
 
-const DEG = Math.PI / 180, RE = 6371, K = 121, NS = 48, GATE = 30;
-const cv = document.getElementById('c'), ctx = cv.getContext('2d'), head = document.getElementById('head'), list = document.getElementById('list');
-const view = { lon: -40 * DEG, lat: 25 * DEG };            // fixed camera on the globe
-let W, H, cx, cy, R;
-let sats = [];                                              // {name, inc, alt, track: Float32Array(K*3)} unit vectors, Earth-fixed
-let revealAt = 0, raw = [], keys = null, stroke = null, results = [], sel = 0, drawing = false;
-const t0 = Date.now();
+// ---------- settings --------------------------------------------------------
+const EARTH_KM = 6371;
+const MINUTES = 121;                 // every satellite gets one position per minute, for 2 hours
+const POINTS = 48;                   // points along your line
+const SAME_PASS = 30;                // a satellite's hits must happen within 30 min of each other
+const LIME = '#c8ff00', WHITE = '#f2f2f2';
+const DEG = Math.PI / 180;
+const CAMERA = { lon: -40 * DEG, lat: 25 * DEG };   // fixed view of the globe
 
-const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+// ---------- state -----------------------------------------------------------
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+const head = document.getElementById('head'), list = document.getElementById('list');
+let cx, cy, radius;                  // where the circle is on screen (set every frame)
+let sats = [];                       // { name, alt, inc, track }  track = flat [x,y,z, x,y,z, ...], one per minute
+let drawing = false, sketch = [];    // your stroke so far, in screen pixels
+let line = null;                     // the recognized line: { keys, points, tol }
+let results = [], selected = 0;      // matching satellites, and which one is highlighted
+let revealedAt = 0;                  // when the first line was finished (satellites fade in from here)
+
+// ---------- vector helpers --------------------------------------------------
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const ang = (a, b) => Math.acos(clamp(dot(a, b), -1, 1));
-const norm = v => { const l = Math.hypot(...v) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
-const slerp = (a, b, t) => { const w = ang(a, b); if (w < 1e-6) return a; const s = Math.sin(w), x = Math.sin((1 - t) * w) / s, y = Math.sin(t * w) / s; return [0, 1, 2].map(i => a[i] * x + b[i] * y); };
+const unit = v => { const n = Math.hypot(...v) || 1; return v.map(x => x / n); };
+const angle = (a, b) => Math.acos(clamp(dot(a, b), -1, 1));
+const slerp = (a, b, t) => {                         // point t (0..1) of the way from a to b, along the globe's surface
+  const w = angle(a, b); if (w < 1e-6) return a;
+  return a.map((x, i) => (x * Math.sin((1 - t) * w) + b[i] * Math.sin(t * w)) / Math.sin(w));
+};
 
-// ---- orthographic projection of unit vectors onto the circle ---------------
-function proj(x, y, z) {
-  const cl = Math.cos(view.lon), sl = Math.sin(view.lon), cp = Math.cos(view.lat), sp = Math.sin(view.lat);
-  const X = x * cl + y * sl, Y = -x * sl + y * cl;
-  return { x: cx + R * Y, y: cy - R * (z * cp - X * sp), front: X * cp + z * sp > 0 };
+// ---------- screen <-> globe (orthographic projection) ----------------------
+const [cosLon, sinLon, cosLat, sinLat] = [Math.cos(CAMERA.lon), Math.sin(CAMERA.lon), Math.cos(CAMERA.lat), Math.sin(CAMERA.lat)];
+
+function toScreen([x, y, z]) {                       // globe -> pixels. `front` = on the side facing us
+  const a = x * cosLon + y * sinLon, b = -x * sinLon + y * cosLon;
+  return { x: cx + radius * b, y: cy - radius * (z * cosLat - a * sinLat), front: a * cosLat + z * sinLat > 0 };
 }
-function unproject(px, py) {                                // screen -> point on the globe (or null outside the circle)
-  const sx = (px - cx) / R, sy = (cy - py) / R, r2 = sx * sx + sy * sy;
-  if (r2 > 1) return null;
-  const d = Math.sqrt(1 - r2), cl = Math.cos(view.lon), sl = Math.sin(view.lon), cp = Math.cos(view.lat), sp = Math.sin(view.lat);
-  const X = d * cp - sy * sp, Z = d * sp + sy * cp;
-  return [X * cl - sx * sl, X * sl + sx * cl, Z];
+function toGlobe(px, py) {                           // pixels -> globe (null if outside the circle)
+  const sx = (px - cx) / radius, sy = (cy - py) / radius, depth2 = 1 - sx * sx - sy * sy;
+  if (depth2 < 0) return null;
+  const d = Math.sqrt(depth2), a = d * cosLat - sy * sinLat, z = d * sinLat + sy * cosLat;
+  return [a * cosLon - sx * sinLon, a * sinLon + sx * cosLon, z];
 }
 
-// ---- data: propagate every satellite over the next two hours ---------------
-async function load() {
-  const omm = await (await fetch('data/sats.json')).json();
-  const gm = [...Array(K)].map((_, k) => satellite.gstime(new Date(t0 + k * 60000)));
-  for (const o of omm) {
-    const rec = satellite.json2satrec(o), epoch = Date.parse(o.EPOCH + 'Z'), tr = new Float32Array(K * 3);
-    let ok = !rec.error;
-    for (let k = 0; ok && k < K; k++) {
-      const p = satellite.sgp4(rec, (t0 + k * 60000 - epoch) / 60000)?.position;
-      if (!p || isNaN(p.x)) { ok = false; break; }
-      const r = Math.hypot(p.x, p.y, p.z), c = Math.cos(gm[k]), s = Math.sin(gm[k]);
-      if (r < RE + 120) { ok = false; break; }
-      tr.set([(p.x * c + p.y * s) / r, (-p.x * s + p.y * c) / r, p.z / r], k * 3);
+// ---------- 3. TRACKS: where is every satellite for the next 2 hours? -------
+async function loadSatellites() {
+  const catalog = await (await fetch('data/sats.json')).json();    // orbital elements (CelesTrak)
+  const start = Date.now();
+  const spin = [...Array(MINUTES)].map((_, m) => satellite.gstime(new Date(start + m * 60000)));   // Earth's rotation each minute
+
+  for (const o of catalog) {
+    const rec = satellite.json2satrec(o), epoch = Date.parse(o.EPOCH + 'Z'), track = [];
+    for (let m = 0; m < MINUTES; m++) {
+      const p = satellite.sgp4(rec, (start + m * 60000 - epoch) / 60000)?.position;   // position in space (km)
+      if (!p || isNaN(p.x)) break;                                                     // propagation failed
+      const r = Math.hypot(p.x, p.y, p.z), c = Math.cos(spin[m]), s = Math.sin(spin[m]);
+      if (r < EARTH_KM + 120) break;                                                   // already re-entered
+      track.push((p.x * c + p.y * s) / r, (-p.x * s + p.y * c) / r, p.z / r);          // turn with the Earth, keep direction only
     }
-    if (ok) sats.push({ name: o.OBJECT_NAME, inc: +o.INCLINATION, track: tr, alt: (Math.cbrt(398600.4418 / (o.MEAN_MOTION * 2 * Math.PI / 86400) ** 2) - RE) | 0 });
+    if (track.length === MINUTES * 3) sats.push({
+      name: o.OBJECT_NAME, inc: +o.INCLINATION, track,
+      alt: Math.round(Math.cbrt(398600.4418 / (o.MEAN_MOTION * 2 * Math.PI / 86400) ** 2) - EARTH_KM),   // Kepler's 3rd law
+    });
   }
   showPrompt();
 }
 
-// ---- line recognition: snap the stroke to ≤ 1 bend -------------------------
-const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-function segDist(p, a, b) {                                 // angular distance from p to the great-circle arc a→b
-  const n = cross(a, b), nl = Math.hypot(...n); if (nl < 1e-9) return ang(p, a);
-  const u = [n[0] / nl, n[1] / nl, n[2] / nl], h = dot(p, u), q = [p[0] - h * u[0], p[1] - h * u[1], p[2] - h * u[2]];
-  if (dot(cross(a, q), u) >= 0 && dot(cross(q, b), u) >= 0) return Math.abs(Math.asin(clamp(h, -1, 1)));   // projects inside the arc
-  return Math.min(ang(p, a), ang(p, b));
+// where is a satellite at a given minute (can be fractional)?  -> unit vector
+function trackPoint(track, minute) {
+  const m = clamp(Math.floor(minute), 0, MINUTES - 2), t = clamp(minute - m, 0, 1), i = m * 3;
+  return unit([0, 1, 2].map(k => track[i + k] * (1 - t) + track[i + 3 + k] * t));
 }
-function fitShape(pts) {                                    // -> [A, B] or [A, C, B]
-  const n = pts.length; if (n < 2) return null;
-  const A = pts[0], B = pts[n - 1], P = pts.filter((_, i) => i % Math.ceil(n / 120) === 0);
-  const err = ks => Math.sqrt(P.reduce((s, p) => s + Math.min(...ks.slice(1).map((k, i) => segDist(p, ks[i], k))) ** 2, 0) / P.length);
-  let path = 0; for (let i = 1; i < n; i++) path += ang(pts[i - 1], pts[i]);
-  const straight = err([A, B]);
-  let best = null, bestErr = Infinity;
-  for (const C of P) {
-    const a = ang(A, C), b = ang(C, B); if (Math.min(a, b) < 0.2 * (a + b)) continue;      // each leg ≥ 20% of the line
-    const e = err([A, C, B]); if (e < bestErr) { bestErr = e; best = C; }
+
+// ---------- 1. DRAW: snap the stroke to a straight line or one bend ---------
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+function distToSegment(p, a, b) {                    // 2D: how far is p from the segment a-b?
+  const len2 = (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2;
+  const t = len2 ? clamp(((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / len2, 0, 1) : 0;
+  return dist(p, [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+}
+
+function fitShape(pts) {                             // pixels in -> [start, end] or [start, corner, end]
+  const A = pts[0], B = pts[pts.length - 1];
+  const few = pts.filter((_, i) => i % Math.ceil(pts.length / 100) === 0);
+  const error = corners => Math.sqrt(few.reduce((sum, p) =>       // how far the stroke strays from these segments (RMS)
+    sum + Math.min(...corners.slice(1).map((c, i) => distToSegment(p, corners[i], c))) ** 2, 0) / few.length);
+
+  let strokeLength = 0; for (let i = 1; i < pts.length; i++) strokeLength += dist(pts[i - 1], pts[i]);
+  const straight = error([A, B]);
+  if (straight < 0.04 * strokeLength) return [A, B];             // already pretty straight
+
+  let best = [A, B], bestError = 0.55 * straight;                // a bend must be clearly better than straight
+  for (const C of few) {                                         // try every point as the corner
+    const a = dist(A, C), b = dist(C, B);
+    if (Math.min(a, b) < 0.2 * (a + b)) continue;                // each side must be a real leg, not a stub
+    const e = error([A, C, B]);
+    if (e < bestError) { bestError = e; best = [A, C, B]; }
   }
-  return best && straight > 0.04 * path && bestErr < 0.55 * straight ? [A, best, B] : [A, B];
+  return best;
 }
 
-function recognize(k) {                                     // shape -> NS evenly spaced points + tolerance
-  const legs = k.slice(1).map((p, i) => ang(k[i], p)), total = legs.reduce((a, b) => a + b, 0), lenKm = total * RE;
-  if (lenKm < 250) return null;
-  const pts = [];
-  for (let j = 0; j < NS; j++) {
-    let d = total * j / (NS - 1), i = 0; while (i < legs.length - 1 && d > legs[i]) { d -= legs[i]; i++; }
-    pts.push(norm(slerp(k[i], k[i + 1], clamp(d / legs[i], 0, 1))));
-  }
-  const c = norm(pts.reduce((a, p) => a.map((v, i) => v + p[i]), [0, 0, 0]));
-  return { keys: k, pts, c, lenKm, tol: clamp(lenKm * .045, 90, 450) / RE };
-}
-
-function match(st) {
-  const res = [], dj = new Float64Array(NS), ij = new Float64Array(NS);
-  for (const sat of sats) {
-    const T = sat.track, hit = new Uint8Array(NS); let cnt = 0, dev = 0, best = 1e9, bj = 0;
-    for (let j = 0; j < NS; j++) {
-      const [px, py, pz] = st.pts[j]; let md = 1e9, mi = 0;
-      for (let k = 0; k < K - 1; k++) {                     // nearest point on the track polyline
-        const o = k * 3, ax = T[o], ay = T[o + 1], az = T[o + 2], ex = T[o + 3] - ax, ey = T[o + 4] - ay, ez = T[o + 5] - az, ee = ex * ex + ey * ey + ez * ez;
-        const t = ee < 1e-18 ? 0 : clamp(((px - ax) * ex + (py - ay) * ey + (pz - az) * ez) / ee, 0, 1);
-        const d2 = (px - ax - t * ex) ** 2 + (py - ay - t * ey) ** 2 + (pz - az - t * ez) ** 2;
-        if (d2 < md) { md = d2; mi = k + t; }
-      }
-      dj[j] = Math.sqrt(md); ij[j] = mi; if (dj[j] < best) { best = dj[j]; bj = j; }
-    }
-    if (best > st.tol) continue;
-    const passes = [];
-    for (let j = 0; j < NS; j++) if (dj[j] <= st.tol && Math.abs(ij[j] - ij[bj]) <= GATE) { hit[j] = 1; cnt++; dev += dj[j]; passes.push(ij[j]); }
-    passes.sort((a, b) => a - b);
-    res.push({ sat, hit, cov: cnt / NS, dev: dev / cnt * RE, pass: passes[passes.length >> 1] });
-  }
-  let sel; for (const th of [.9, .75, .6, .45, .3]) { sel = res.filter(r => r.cov >= th); if (sel.length >= 5) break; }
-  return sel.sort((a, b) => (b.cov - b.dev / 2000) - (a.cov - a.dev / 2000));
-}
-
-// ---- input -----------------------------------------------------------------
-cv.onpointerdown = e => {
-  const g = unproject(e.clientX, e.clientY); if (!g) return;
-  cv.setPointerCapture(e.pointerId);
-  stroke = null; results = []; raw = [g]; keys = null; drawing = true; head.textContent = ''; list.textContent = '';
-};
-cv.onpointermove = e => {
-  const g = drawing && unproject(e.clientX, e.clientY); if (!g) return;
-  const l = raw[raw.length - 1], px = ang(l, g) * R, steps = Math.ceil(px / 5);
-  if (px > 3) for (let i = 1; i <= steps; i++) raw.push(norm(l.map((v, k) => v + (g[k] - v) * i / steps)));
-  keys = fitShape(raw);                                     // live: show what the software recognizes
-};
-cv.onpointerup = () => {
-  if (!drawing) return; drawing = false;
-  stroke = keys && recognize(keys);
-  if (!stroke) { raw = []; keys = null; return showPrompt('too short — draw a longer line'); }
-  results = match(stroke); results.forEach(q => q.phase = Math.random() * 16); sel = 0; showResults();
-  if (!revealAt) revealAt = performance.now(); document.body.classList.add('started');   // first line drawn: bring in the satellites + UI
-};
-function restart() { stroke = null; raw = []; keys = null; results = []; drawing = false; revealAt = 0; document.body.classList.remove('started'); showPrompt(); }
-document.getElementById('restart').onclick = restart;
-addEventListener('keydown', e => {
-  if (e.key === 'Escape') restart();
-  if (results.length && e.key === 'ArrowRight') { sel = (sel + 1) % results.length; showResults(); }
-  if (results.length && e.key === 'ArrowLeft') { sel = (sel + results.length - 1) % results.length; showResults(); }
-});
-
-function showPrompt(msg = '') { head.textContent = `draw one line in the circle:\nstraight, or with one bend\n${msg}`; list.textContent = ''; }
-function showResults() {
-  head.textContent = `${stroke.keys.length === 3 ? 'one bend' : 'straight line'} · ${results.length} satellites on your line (±${(stroke.tol * RE).toFixed(0)} km)\n` +
-    (results.length ? '' : 'none — try another line\n') + 'click a name, or ← → · esc to clear';
-  list.textContent = '';
-  results.forEach((r, i) => {
-    const row = document.createElement('div');
-    row.className = 'row' + (i === sel ? ' sel' : '');
-    const a = document.createElement('span'), b = document.createElement('span');
-    a.textContent = r.sat.name; b.textContent = `${r.sat.alt} km · ${r.sat.inc.toFixed(0)}°`; row.append(a, b);
-    row.onclick = () => { sel = i; showResults(); };
-    list.appendChild(row);
-    if (i === sel) row.scrollIntoView({ block: 'nearest' });
+// ---------- 2. SAMPLE: evenly spaced points along the shape, on the globe ---
+function resample(keys, n) {                         // keys = 2 or 3 points on the globe
+  const legs = keys.slice(1).map((k, i) => angle(keys[i], k)), total = legs.reduce((a, b) => a + b, 0);
+  return [...Array(n)].map((_, j) => {
+    let d = total * j / (n - 1), leg = 0;
+    while (leg < legs.length - 1 && d > legs[leg]) d -= legs[leg++];
+    return unit(slerp(keys[leg], keys[leg + 1], clamp(d / legs[leg], 0, 1)));
   });
 }
 
-// ---- drawing ---------------------------------------------------------------
-function path(vs) { ctx.beginPath(); let pen = false; for (const v of vs) { const p = proj(...v); if (p.front) { pen ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); pen = true; } else pen = false; } }
-function trackVecs(T, a, b) { const out = []; for (let k = Math.max(0, Math.floor(a)); k < Math.min(K - 1, Math.ceil(b)); k++) for (let q = 0; q < 3; q++) { const o = k * 3, f = q / 3; out.push(norm([0, 1, 2].map(i => T[o + i] + (T[o + 3 + i] - T[o + i]) * f))); } return out; }
-function satAt(T, m) { const k = clamp(Math.floor(m), 0, K - 2), f = clamp(m - k, 0, 1), o = k * 3; return norm([0, 1, 2].map(i => T[o + i] + (T[o + 3 + i] - T[o + i]) * f)); }
-function arcPoints(k) { const out = []; for (let i = 0; i < k.length - 1; i++) for (let q = 0; q <= 30; q++) out.push(slerp(k[i], k[i + 1], q / 30)); return out; }
+function recognize(pixels) {                         // your stroke (pixels) -> the recognized line, or null if too short
+  const keys = fitShape(pixels).map(p => toGlobe(...p));
+  const length = keys.slice(1).reduce((sum, k, i) => sum + angle(keys[i], k), 0) * EARTH_KM;   // km
+  if (length < 250) return null;
+  return { keys, points: resample(keys, POINTS), tol: clamp(length * 0.045, 90, 450) / EARTH_KM };   // tolerance ~4.5% of length
+}
 
-const INK = '#f2f2f2', ACCENT = '#c8ff00';
-function frame(now) {
-  if (W !== innerWidth || H !== innerHeight) { W = cv.width = innerWidth; H = cv.height = innerHeight; }
-  cx = W / 2 + 150; cy = H / 2; R = Math.min(W - 400, H - 50) / 2;
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#050505'; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.fill();            // the Earth: just a circle
-  ctx.strokeStyle = INK; ctx.lineWidth = 1; ctx.stroke();
-
-  const r = results[sel], e = now / 1000;                // seconds since page load (rAF time)
-  ctx.lineCap = ctx.lineJoin = 'round';
-  // the whole catalog, always orbiting (real orbital motion, sped up); fades at the loop point so nothing teleports
-  const rv = revealAt ? clamp((now - revealAt) / 2500, 0, 1) : 0;      // satellites fade in after the first line
-  if (rv > 0) { const gm = (e * 2) % 120, fade = rv * Math.min(1, gm / 4, (120 - gm) / 4); ctx.beginPath(); const gh = [];
-    for (const s of sats) {
-      const a = proj(...satAt(s.track, gm - 1)), b = proj(...satAt(s.track, gm));
-      if (!b.front) continue;
-      if (a.front) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); }
-      gh.push(b);
-    }
-    ctx.strokeStyle = `rgba(255,255,255,${.2 * fade})`; ctx.lineWidth = 1; ctx.stroke();
-    ctx.fillStyle = `rgba(255,255,255,${.45 * fade})`; for (const p of gh) ctx.fillRect(p.x - .9, p.y - .9, 1.8, 1.8); }
-
-  if (stroke) {
-    ctx.strokeStyle = 'rgba(200,255,0,.13)'; ctx.lineWidth = 2 * stroke.tol * R; path(arcPoints(stroke.keys)); ctx.stroke();       // tolerance band
-    ctx.strokeStyle = INK; ctx.lineWidth = 2; path(arcPoints(stroke.keys)); ctx.stroke();                                          // recognized line
-    stroke.pts.forEach((v, j) => { const p = proj(...v); if (!p.front) return; ctx.beginPath(); ctx.arc(p.x, p.y, r?.hit[j] ? 2.6 : 1.6, 0, 7); ctx.fillStyle = r?.hit[j] ? ACCENT : INK; ctx.fill(); });
-    if (stroke.keys.length === 3) { const p = proj(...stroke.keys[1]); ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, 7); ctx.stroke(); }   // the bend
-
-    // satellite particles: each floats along its own orbit, passing through the line at its own time
-    const pos = q => clamp(q.pass + (e * 1 + q.phase) % 16 - 8, 0, K - 1.01);
-    if (r) { ctx.strokeStyle = 'rgba(200,255,0,.55)'; ctx.lineWidth = 1; path(trackVecs(r.sat.track, 0, K)); ctx.stroke(); }          // selected: whole 2 h orbit
-    ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 1; ctx.beginPath(); const heads = [];
-    for (const q of results) {
-      const m = pos(q), a = proj(...satAt(q.sat.track, m - .8)), b = proj(...satAt(q.sat.track, m));
-      if (!b.front) continue;
-      if (a.front) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); }
-      heads.push([b, q]);
-    }
-    ctx.stroke();
-    ctx.font = '12px Helvetica, Arial, sans-serif';
-    for (const [p, q] of heads) {
-      const on = q === r; ctx.fillStyle = on ? ACCENT : INK; ctx.beginPath(); ctx.arc(p.x, p.y, on ? 5 : 2.6, 0, 7); ctx.fill();
-      if (on) { ctx.fillStyle = INK; ctx.fillText(q.sat.name, p.x + 10, p.y - 8); }
-    }
-  } else if (drawing && raw.length > 1) {
-    ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 1.5; path(raw); ctx.stroke();                                        // what you drew
-    if (keys) { ctx.strokeStyle = INK; ctx.lineWidth = 2.5; path(arcPoints(keys)); ctx.stroke(); }                                // what it snaps to
+// ---------- 4. MATCH: which orbits pass near the line? ----------------------
+function closestOnTrack(track, p) {                  // -> [distance, minute] of the nearest point on the ground track
+  let best = Infinity, bestMinute = 0;
+  for (let m = 0; m < MINUTES - 1; m++) {            // the track is a chain of short segments, one per minute
+    const i = m * 3, ex = track[i + 3] - track[i], ey = track[i + 4] - track[i + 1], ez = track[i + 5] - track[i + 2];
+    const len2 = ex * ex + ey * ey + ez * ez;
+    const t = len2 ? clamp(((p[0] - track[i]) * ex + (p[1] - track[i + 1]) * ey + (p[2] - track[i + 2]) * ez) / len2, 0, 1) : 0;
+    const dx = p[0] - track[i] - t * ex, dy = p[1] - track[i + 1] - t * ey, dz = p[2] - track[i + 2] - t * ez;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < best) { best = d2; bestMinute = m + t; }
   }
+  return [Math.sqrt(best), bestMinute];
+}
+
+function match(line) {
+  const found = [];
+  for (const sat of sats) {
+    const nearest = line.points.map(p => closestOnTrack(sat.track, p));           // [distance, minute] for every point
+    const closest = nearest.reduce((a, b) => (b[0] < a[0] ? b : a));
+    if (closest[0] > line.tol) continue;                                           // never comes near the line
+    const hit = nearest.map(([d, m]) => d <= line.tol && Math.abs(m - closest[1]) <= SAME_PASS);   // near, and on the same pass
+    const minutes = nearest.filter((_, i) => hit[i]).map(h => h[1]).sort((a, b) => a - b);
+    found.push({ sat, hit, coverage: minutes.length / POINTS, pass: minutes[minutes.length >> 1], phase: Math.random() * 16 });
+  }
+  found.sort((a, b) => b.coverage - a.coverage);
+  const good = found.filter(r => r.coverage >= 0.5);
+  return good.length ? good : found.slice(0, 5);                                   // best 5 if nothing covers half
+}
+
+// ---------- input -----------------------------------------------------------
+canvas.onpointerdown = e => {
+  if (!toGlobe(e.clientX, e.clientY)) return;                // must start inside the circle
+  canvas.setPointerCapture(e.pointerId);
+  line = null; results = []; sketch = [[e.clientX, e.clientY]]; drawing = true;
+  head.textContent = ''; list.textContent = '';
+};
+canvas.onpointermove = e => {
+  if (!drawing || !toGlobe(e.clientX, e.clientY)) return;
+  const p = [e.clientX, e.clientY];
+  if (dist(p, sketch[sketch.length - 1]) > 3) sketch.push(p);
+};
+canvas.onpointerup = () => {
+  if (!drawing) return; drawing = false;
+  line = sketch.length > 1 ? recognize(sketch) : null;
+  if (!line) { sketch = []; return showPrompt('too short — draw a longer line'); }
+  results = match(line); selected = 0; showResults();
+  if (!revealedAt) revealedAt = performance.now();           // first line: bring the satellites in
+  document.body.classList.add('started');
+};
+function restart() {
+  line = null; sketch = []; results = []; drawing = false; revealedAt = 0;
+  document.body.classList.remove('started'); showPrompt();
+}
+document.getElementById('restart').onclick = restart;
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') restart();
+  if (!results.length) return;
+  if (e.key === 'ArrowRight') { selected = (selected + 1) % results.length; showResults(); }
+  if (e.key === 'ArrowLeft') { selected = (selected + results.length - 1) % results.length; showResults(); }
+});
+
+// ---------- text + list -----------------------------------------------------
+function showPrompt(message = '') {
+  head.textContent = `draw one line in the circle:\nstraight, or with one bend\n${message}`; list.textContent = '';
+}
+function showResults() {
+  head.textContent = `${line.keys.length === 3 ? 'one bend' : 'straight line'} · ${results.length} satellites on your line ` +
+    `(±${Math.round(line.tol * EARTH_KM)} km)\n${results.length ? '' : 'none — try another line\n'}click a name, or ← → · esc to clear`;
+  list.textContent = '';
+  results.forEach((r, i) => {
+    const row = document.createElement('div'), name = document.createElement('span'), info = document.createElement('span');
+    row.className = 'row' + (i === selected ? ' sel' : '');
+    name.textContent = r.sat.name; info.textContent = `${r.sat.alt} km · ${Math.round(r.sat.inc)}°`;
+    row.append(name, info);
+    row.onclick = () => { selected = i; showResults(); };
+    list.appendChild(row);
+    if (i === selected) row.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+// ---------- drawing helpers -------------------------------------------------
+function strokePath(color, width) { ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke(); }
+function dot2d(p, r, color) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill(); }
+
+function polyline(vectors) {                         // trace globe points as a path, breaking at the horizon
+  ctx.beginPath(); let down = false;
+  for (const v of vectors) {
+    const p = toScreen(v);
+    if (p.front) { down ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); down = true; } else down = false;
+  }
+}
+function trail(track, minute, length) {              // adds a short comet trail to the current path; returns the head position
+  const head = toScreen(trackPoint(track, minute)), tail = toScreen(trackPoint(track, minute - length));
+  if (!head.front) return null;
+  if (tail.front) { ctx.moveTo(tail.x, tail.y); ctx.lineTo(head.x, head.y); }
+  return head;
+}
+
+// ---------- drawing the scene ----------------------------------------------
+function drawCatalog(seconds, fadeIn) {              // every satellite, orbiting (real motion, 2 min per second)
+  const minute = (seconds * 2) % 120, fade = fadeIn * Math.min(1, minute / 4, (120 - minute) / 4);   // fade at the loop point
+  const heads = []; ctx.beginPath();
+  for (const s of sats) { const h = trail(s.track, minute, 1); if (h) heads.push(h); }
+  strokePath(`rgba(255,255,255,${0.2 * fade})`, 1);
+  ctx.fillStyle = `rgba(255,255,255,${0.45 * fade})`;
+  for (const h of heads) ctx.fillRect(h.x - 0.9, h.y - 0.9, 1.8, 1.8);
+}
+
+function drawLine(top) {
+  const arc = resample(line.keys, 100);
+  polyline(arc); strokePath('rgba(200,255,0,.13)', 2 * line.tol * radius);                // tolerance band
+  polyline(arc); strokePath(WHITE, 2);                                                       // the recognized line
+  line.points.forEach((v, j) => {                                                            // its sample points; lime = hit by the selected satellite
+    const p = toScreen(v); if (p.front) dot2d(p, top?.hit[j] ? 2.6 : 1.6, top?.hit[j] ? LIME : WHITE);
+  });
+  if (line.keys.length === 3) { const bend = toScreen(line.keys[1]); ctx.beginPath(); ctx.arc(bend.x, bend.y, 8, 0, 7); strokePath(WHITE, 1); }   // ring at the bend
+}
+
+function drawMatches(seconds, top) {                 // each match floats along its own orbit, crossing your line at its own time
+  if (top) {                                         // the selected satellite's whole 2 hour orbit
+    polyline([...Array(MINUTES * 3)].map((_, i) => trackPoint(top.sat.track, i / 3)));
+    strokePath('rgba(200,255,0,.55)', 1);
+  }
+  const heads = []; ctx.beginPath();
+  for (const r of results) {
+    const minute = clamp(r.pass + (seconds + r.phase) % 16 - 8, 0, MINUTES - 1.01);       // wander +-8 min around the crossing
+    const h = trail(r.sat.track, minute, 0.8); if (h) heads.push([h, r]);
+  }
+  strokePath('rgba(255,255,255,.4)', 1);
+  ctx.font = '12px Helvetica, Arial, sans-serif';
+  for (const [h, r] of heads) {
+    dot2d(h, r === top ? 5 : 2.6, r === top ? LIME : WHITE);
+    if (r === top) { ctx.fillStyle = WHITE; ctx.fillText(r.sat.name, h.x + 10, h.y - 8); }
+  }
+}
+
+function drawSketch() {                              // while you draw: your raw stroke, and what it snaps to
+  if (sketch.length < 2) return;
+  ctx.beginPath(); sketch.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); strokePath('rgba(255,255,255,.4)', 1.5);
+  polyline(resample(fitShape(sketch).map(p => toGlobe(...p)), 100)); strokePath(WHITE, 2.5);
+}
+
+function frame(now) {
+  canvas.width = innerWidth; canvas.height = innerHeight;
+  cx = innerWidth / 2 + 150; cy = innerHeight / 2; radius = Math.min(innerWidth - 400, innerHeight - 50) / 2;
+  ctx.lineCap = ctx.lineJoin = 'round';
+
+  ctx.fillStyle = '#050505'; ctx.beginPath(); ctx.arc(cx, cy, radius, 0, 7); ctx.fill();   // the Earth: just a circle
+  strokePath(WHITE, 1);
+
+  const seconds = now / 1000, top = results[selected];
+  const fadeIn = revealedAt ? clamp((now - revealedAt) / 2500, 0, 1) : 0;
+  if (fadeIn > 0) drawCatalog(seconds, fadeIn);
+  if (line) { drawLine(top); drawMatches(seconds, top); }
+  else if (drawing) drawSketch();
   requestAnimationFrame(frame);
 }
 
-load().catch(e => head.textContent ='could not load data/sats.json — serve this folder over http\n' + e);
+// ---------- go --------------------------------------------------------------
+loadSatellites().catch(e => { head.textContent = 'could not load data/sats.json — serve this folder over http\n' + e; });
 requestAnimationFrame(frame);

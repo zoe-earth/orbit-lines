@@ -22,6 +22,23 @@ a diagonal catches mid-inclination ones. No orbit bends, so a bent line only eve
 
 All the logic is in [`app.js`](app.js) (`fitShape` → `recognize` → `match`), no build step, no framework.
 
+## Recreate it from scratch
+
+Build it in this order; each step works on its own before you add the next.
+
+1. **A circle that is a globe.** Canvas + an orthographic projection (`toScreen` / `toGlobe`). Points on the globe are
+   unit vectors `[x, y, z]`.
+2. **Draw a line on it.** Collect pointer positions in pixels; ignore points outside the circle.
+3. **Snap it** (`fitShape`): compare your stroke to a straight segment, then try every point as a corner and keep the
+   corner only if it fits clearly better. Do this in plain 2D pixels, no spherical math needed.
+4. **Put it on the globe** (`recognize`, `resample`): convert the 2–3 key points to unit vectors and walk along the
+   arcs (`slerp`) to get 48 evenly spaced points.
+5. **Get satellite tracks** (`loadSatellites`): feed CelesTrak orbital elements to satellite.js `sgp4()` once per
+   minute for 2 hours, rotate each position by the Earth's spin (`gstime`), keep just the direction.
+6. **Match** (`match`): for each point on your line find the nearest spot on each track; a point is "hit" if that's
+   within a tolerance. Rank satellites by how many points they hit.
+7. **Make it move**: interpolate each track by fractional minute (`trackPoint`) and draw a short trail.
+
 ## Run it
 
 It's a static site, but it loads `data/sats.json`, so it must be served over http (not opened as `file://`).
